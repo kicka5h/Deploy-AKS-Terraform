@@ -1,0 +1,23 @@
+steps:
+  - task: terraformInstaller@0
+    displayName: "Install Terraform $(tf_version)"
+    inputs:
+      terraformVersion: $(tf_version)
+  - task: TerraformTaskV1@0
+    displayName: "Run > terraform init"
+    inputs:
+      command: "init"
+      commandOptions: "-input=false"
+      backendServiceArm: ${{ parameters.az_service_connection }}
+      backendAzureRmResourceGroupName: "$(tf_state_rg)"
+      backendAzureRmStorageAccountName: "$(tf_state_stgacct_name)"
+      backendAzureRmContainerName: $(tf_state_container_name)
+      backendAzureRmKey: "$(tf_environment).terraform.tstate"
+      workingDirectory: "$(Pipeline.Workspace)/$(tf_environment)-terraform-plan"
+  - task: TerraformTaskV1@0
+    displayName: "Run > terraform apply"
+    inputs:
+      command: "apply"
+      commandOptions: "-input=false -no-color -auto-approve $(tf_environment).tfplan"
+      environmentServiceNameAzureRM: ${{ parameters.az_service_connection }}
+      workingDirectory: "$(Pipeline.Workspace)/$(tf_environment)-terraform-plan"

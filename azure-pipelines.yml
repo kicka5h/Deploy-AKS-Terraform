@@ -1,0 +1,69 @@
+trigger:
+  batch: "true"
+  branches:
+    include:
+    - master
+    - sc*
+  paths:
+    exclude:
+      - docs/*
+      - README.md
+
+pool:
+  vmImage: "ubuntu-latest"
+
+resources:
+- repo: self
+
+variables:
+  kubelogin_binary: "https://github.com/Azure/kubelogin/releases/download/v0.0.5/kubelogin-linux-amd64.zip"
+  tf_version: "1.3.3"
+  tf_log: "DEBUG"
+
+stages:
+# Terraform Plan (Lab)
+- stage: Lab_Plan
+  displayName: Terraform Plan (Lab)
+  condition: and(succeeded(), in(variables['Build.Reason'], 'PullRequest', 'IndividualCI', 'BatchedCI', 'Manual'))
+  dependsOn: []
+  variables:
+  - group: Lab
+  - name: az_service_connection_terraform
+    value: Lab-KubeTerraform
+  - name: enabled
+    value: "true"
+  jobs:
+  - job: Lab_Plan
+    displayName: Plan (Lab)
+    condition: ne('${{ variables.enabled }}', false)
+    steps:
+    - template: templates/terraform-plan.yml
+      parameters:
+        az_service_connection: ${{ variables.az_service_connection_terraform }}
+
+# Terraform Deployment (Lab)
+- stage: Lab_Deploy
+  displayName: Terraform Deployment (Lab)
+  condition: and(succeeded(), in(variables['Build.Reason'], 'IndividualCI', 'BatchedCI', 'Manual'))
+  dependsOn:
+    - Lab_Plan
+  variables:
+  - group: Lab
+  - name: az_service_connection_terraform
+    value: Lab-KubeTerraform
+  - name: az_service_connection_aks
+    value: Lab-KubeAKS
+  - name: enabled
+    value: "true"
+  jobs:  
+  - deployment: Lab_Deploy
+    displayName: Deploy (Lab)
+    environment: Lab
+    condition: ne('${{ variables.enabled }}', false)
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - template: templates/terraform-deploy.yml
+            parameters:
+              az_service_connection: ${{ variables.az_service_connection_terraform }}

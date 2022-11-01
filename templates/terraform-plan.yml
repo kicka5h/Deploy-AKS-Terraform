@@ -1,0 +1,36 @@
+steps:
+  - task: terraformInstaller@0
+    displayName: "Install Terraform $(tf_version)"
+    inputs:
+      terraformVersion: $(tf_version)
+  - task: TerraformTaskV1@0
+    displayName: "Run > terraform init"
+    inputs:
+      command: "init"
+      commandOptions: "-input=false"
+      backendServiceArm: ${{ parameters.az_service_connection }}
+      backendAzureRmResourceGroupName: "$(tf_state_rg)"
+      backendAzureRmStorageAccountName: "$(tf_state_stgacct_name)"
+      backendAzureRmContainerName: $(tf_state_container_name)
+      backendAzureRmKey: "$(tf_environment).terraform.tstate"
+      workingDirectory: "$(System.DefaultWorkingDirectory)/terraform"
+  - task: TerraformTaskV1@0
+    displayName: "Run > terraform plan"
+    inputs:
+      command: "plan"
+      commandOptions: "-input=false -no-color -var-file=env/$(resource_prefix)$(tf_environment).tfvars -out=$(Build.ArtifactStagingDirectory)/$(tf_environment).tfplan"
+      environmentServiceNameAzureRM: ${{ parameters.az_service_connection }}
+      workingDirectory: "$(System.DefaultWorkingDirectory)/terraform"
+  - task: CopyFiles@2
+    displayName: "Copy Terraform Files"
+    inputs:
+      sourceFolder: ./terraform
+      contents: |
+        **
+        !.terraform/**/*
+      targetFolder: $(Build.ArtifactStagingDirectory)
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish Terraform Files"
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+      ArtifactName: '$(tf_environment)-terraform-plan'
