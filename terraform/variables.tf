@@ -45,7 +45,7 @@ variable "container_registry_sku" {
 
 variable "env" {
   description = "Environment name"
-  default = "Lab"
+  default = "lab"
 }
 
 variable "location" {
@@ -60,4 +60,21 @@ variable "tags" {
     Environment  = "Lab"
     Application = "Kubernetes"
   }
+}
+
+variable "vnet_address_space" {
+  description = "VNet address space"
+  type = list(string)
+  default = ["10.11.0.0/16"]
+}
+
+variable "vnet_dns_servers" {
+  description = "VNet DNS Servers"
+  type = list(string)
+  default = [""]
+}
+
+variable "vnet_subnet1_address_prefix" {
+  description = "VNet Subnet1 subnet address prefix"
+  default = "10.11.2.0/21"
 }

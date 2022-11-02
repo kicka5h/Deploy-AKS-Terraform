@@ -3,22 +3,31 @@ steps:
     displayName: "Install Terraform $(tf_version)"
     inputs:
       terraformVersion: $(tf_version)
-  - task: TerraformTaskV1@0
+  #- task: AzureCLI@2
+  #  displayName: "Break lease on terraform state"
+  #  name: BreakLease
+  #  inputs:
+  #    azureSubscription: ${{ parameters.az_service_connection }}
+  #    scriptType: "pscore"
+  #    scriptLocation: "inlineScript"
+  #    inlineScript: "az storage blob lease break --container-name '$(tf_state_container_name)' --blob-name '$(tf_environment).terraform.tfstate' --account-name '$(tf_state_stgacct_name)'"
+  - task: TerraformTaskV2@2
     displayName: "Run > terraform init"
     inputs:
+      provider: "azurerm"
       command: "init"
       commandOptions: "-input=false"
       backendServiceArm: ${{ parameters.az_service_connection }}
       backendAzureRmResourceGroupName: "$(tf_state_rg)"
       backendAzureRmStorageAccountName: "$(tf_state_stgacct_name)"
       backendAzureRmContainerName: $(tf_state_container_name)
-      backendAzureRmKey: "$(tf_environment).terraform.tstate"
+      backendAzureRmKey: "$(tf_environment).terraform.tfstate"
       workingDirectory: "$(System.DefaultWorkingDirectory)/terraform"
-  - task: TerraformTaskV1@0
+  - task: TerraformTaskV2@2
     displayName: "Run > terraform plan"
     inputs:
       command: "plan"
-      commandOptions: "-input=false -no-color -var-file=env/$(resource_prefix)$(tf_environment).tfvars -out=$(Build.ArtifactStagingDirectory)/$(tf_environment).tfplan"
+      commandOptions: "-input=false -no-color -var-file=env/$(tf_environment).tfvars -out=$(Build.ArtifactStagingDirectory)/$(tf_environment).tfplan"
       environmentServiceNameAzureRM: ${{ parameters.az_service_connection }}
       workingDirectory: "$(System.DefaultWorkingDirectory)/terraform"
   - task: CopyFiles@2

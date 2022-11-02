@@ -13,3 +13,6 @@ env = "lab"
 tags = {
   Environment  = "lab"
 }
+vnet_address_space = ["10.11.0.0/16"]
+vnet_dns_servers = null
+vnet_subnet1_address_prefix = "10.11.2.0/24"
