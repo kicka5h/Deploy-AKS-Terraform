@@ -10,16 +10,106 @@ on:
         - '.github/workflows/**'
 
 jobs:
-    Git-Config:
-        name: git-config
-        runs-on: ubuntu-latest
-        steps:
-          - run: git config --global url."https://oauth2:${{ secrets.PAT }}@github.com"insteadOf https://github.com
+            PR-Validate:
+              name: PR Validate
+              runs-on: az-terraform
+              defaults:
+                run:
+                  working-directory: 'terraform/env/lab**'
+          
+              steps:
+                - name: Checkout
+                  uses: actions/checkout@v3
 
-    TF-Validate:
-        name: tf-validate
-        secrets: inherit
-        defaults:
-          run: 
-            working-directory: ./terraform/env/lab**
-        uses: kicka5h/github-reusable-workflows/.github/workflows/terraformm/tfvalidate.yml@main
+                - name: Git Config
+                  id: git-config
+                  run: git config --global url."https://oauth2:${{ secrets.PAT }}@github.com"insteadOf https://github.com
+          
+                - name: Install Terraform
+                  id: install_terraform
+                  uses: hashicorp/setup-terraform@v2
+          
+                - name: Check Github Configure
+                  id: GH_Check
+                  run: git config --global --list
+          
+                - name: Terraform Init
+                  id: init
+                  run: terraform init -input=false
+          
+                - name: Terraform Fmt
+                  id: fmt
+                  run: terraform fmt --recursive
+          
+                - name: Terraform Validate
+                  id: validate
+                  run: terraform validate -no-color
+          
+                - name: Terraform Plan
+                  id: plan
+                  run: |
+                    terraform plan \
+                      -lock=false \
+                      -input=false \
+                      -var="do_token=${{ secrets.do_token}}"
+          
+                - uses: actions/github-script@v6
+                  if: ${{ github.event_name == 'pull_request' }}
+                  env:
+                    PLAN: "terraform\n${{ steps.plan.outputs.stdout }}"
+                    VALIDATION: "${{ steps.validate.outputs.stdout }}"
+                  with:
+                    github-token: ${{ secrets.PAT }}
+                    script: |
+                      // 1. Retrieve existing bot comments for the PR
+                      const { data: comments } = await github.rest.issues.listComments({
+                        owner: context.repo.owner,
+                        repo: context.repo.repo,
+                        issue_number: context.issue.number,
+                      })
+                      const botComment = comments.find(comment => {
+                        return comment.user.type === 'Bot' && comment.body.includes('Terraform Format and Style')
+                      })
+          
+                      
+                      // 2. Prepare format of the comment
+                      const output = `#### Terraform Format and Style 🖌\` ${{ steps.fmt.outcome }}\`
+                      #### Terraform Initialization ⚙️\`${{ steps.init.outcome }}\`
+                      #### Terraform Validation 🤖\`${{ steps.validate.outcome }}\`
+          
+                      <details><summary>Validation Output</summary>
+          
+                      \`\`\`\n
+                      ${process.env.VALIDATION}
+                      \`\`\`
+          
+                      </details>
+          
+                      #### Terraform Plan 📖\`${{ steps.plan.outcome }}\`
+          
+                      <details><summary>Show Plan</summary>
+          
+                      \`\`\`\n
+                      ${process.env.PLAN}
+                      \`\`\`
+          
+                      </details>
+          
+                      *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`, Working Directory: \, Workflow: \`${{ github.workflow }}\`*`;
+          
+                      // 3. If we have a comment, update it, otherwise create a new one
+                      if (botComment) {
+                        github.rest.issues.updateComment({
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          comment_id: botComment.id,
+                          body: output
+                        })
+                      } else {
+                        github.rest.issues.createComment({
+                          issue_number: context.issue.number,
+                          owner: context.repo.owner,
+                          repo: context.repo.repo,
+                          body: output
+                        })
+                      }
