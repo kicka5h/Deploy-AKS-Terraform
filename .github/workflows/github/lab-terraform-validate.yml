@@ -1,0 +1,25 @@
+name: "PR Lab TF Validate"
+run-name: Pull Request Lab TF Validate
+
+on:
+  pull_request:
+    branches:
+    - main
+    paths:
+        - 'terraform/env/lab'
+        - '.github/workflows/**'
+
+jobs:
+    Git-Config:
+        name: git-config
+        runs-on: ubuntu-latest
+        steps:
+          - run: git config --global url."https://oauth2:${{ secrets.PAT }}@github.com"insteadOf https://github.com
+
+    TF-Validate:
+        name: tf-validate
+        secrets: inherit
+        defaults:
+          run: 
+            working-directory: ./terraform/env/lab**
+        uses: kicka5h/github-reusable-workflows/.github/workflows/terraformm/tfvalidate.yml@main
