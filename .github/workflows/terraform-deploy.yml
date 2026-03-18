@@ -1,0 +1,231 @@
+name: "Terraform Deploy"
+run-name: "Deploy Terraform (${{ github.ref_name }})"
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "terraform/**"
+
+permissions:
+  contents: read
+
+jobs:
+  # -------------------------------------------------------
+  # Detect which environments were changed in the merge
+  # -------------------------------------------------------
+  detect-changes:
+    name: Detect Changed Environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.filter.outputs.environments }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed environments
+        id: filter
+        run: |
+          # Compare with the previous commit on main
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- terraform/)
+
+          SHARED_CHANGED="false"
+          if echo "$CHANGED_FILES" | grep -qvE '^terraform/env/'; then
+            SHARED_CHANGED="true"
+          fi
+
+          ENVS=()
+          if [ "$SHARED_CHANGED" = "true" ]; then
+            for f in terraform/env/*.tfvars; do
+              ENV_NAME=$(basename "$f" .tfvars)
+              ENVS+=("$ENV_NAME")
+            done
+          else
+            for f in $(echo "$CHANGED_FILES" | grep '^terraform/env/' || true); do
+              ENV_NAME=$(basename "$f" .tfvars)
+              ENVS+=("$ENV_NAME")
+            done
+          fi
+
+          UNIQUE_ENVS=$(printf '%s\n' "${ENVS[@]}" | sort -u | jq -R . | jq -sc .)
+          echo "environments=$UNIQUE_ENVS" >> "$GITHUB_OUTPUT"
+          echo "Deploying environments: $UNIQUE_ENVS"
+
+  # -------------------------------------------------------
+  # Deploy each changed environment
+  # -------------------------------------------------------
+  deploy:
+    name: "Deploy (${{ matrix.environment }})"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.environments != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+    environment: ${{ matrix.environment }}
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Git Config
+        run: git config --global url."https://oauth2:${{ secrets.PAT }}@github.com".insteadOf https://github.com
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: |
+          terraform init -input=false \
+            -backend-config="key=${{ matrix.environment }}.tfstate" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="subscription_id=${{ secrets.TF_STATE_SUBSCRIPTION_ID }}"
+
+      - name: Terraform Plan
+        run: |
+          terraform plan \
+            -var-file="env/${{ matrix.environment }}.tfvars" \
+            -input=false \
+            -out="${{ matrix.environment }}.tfplan"
+
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -input=false "${{ matrix.environment }}.tfplan"
+
+  # -------------------------------------------------------
+  # Post-deploy Smoke Test
+  # -------------------------------------------------------
+  smoke-test:
+    name: "Smoke Test (${{ matrix.environment }})"
+    needs: [detect-changes, deploy]
+    if: needs.detect-changes.outputs.environments != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+    environment: ${{ matrix.environment }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.ARM_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.ARM_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.ARM_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.ARM_TENANT_ID }}"
+            }
+
+      # --- Validate AKS cluster health ---
+      - name: Validate AKS Cluster Health
+        run: |
+          ENV_NAME="${{ matrix.environment }}"
+          echo "Checking AKS cluster health for $ENV_NAME..."
+
+          # Primary cluster
+          CLUSTER_STATE=$(az aks show \
+            --name "${ENV_NAME}-KubeAKS" \
+            --resource-group "${ENV_NAME}-kubeRG" \
+            --query "provisioningState" -o tsv 2>/dev/null || echo "Unknown")
+          echo "Primary cluster state: $CLUSTER_STATE"
+
+          if [ "$CLUSTER_STATE" != "Succeeded" ]; then
+            echo "::error::Primary AKS cluster is not in Succeeded state: $CLUSTER_STATE"
+            exit 1
+          fi
+
+          # Check node pool health
+          az aks nodepool list \
+            --cluster-name "${ENV_NAME}-KubeAKS" \
+            --resource-group "${ENV_NAME}-kubeRG" \
+            --query "[].{Name:name, State:provisioningState, Count:count, VMSize:vmSize}" \
+            -o table
+
+          # DR cluster (if exists)
+          DR_STATE=$(az aks show \
+            --name "${ENV_NAME}-KubeAKS-dr" \
+            --resource-group "${ENV_NAME}-kubeRG-dr" \
+            --query "provisioningState" -o tsv 2>/dev/null || echo "NotDeployed")
+          echo "DR cluster state: $DR_STATE"
+
+          if [ "$DR_STATE" != "NotDeployed" ] && [ "$DR_STATE" != "Succeeded" ]; then
+            echo "::error::DR AKS cluster is not in Succeeded state: $DR_STATE"
+            exit 1
+          fi
+
+      # --- k6 Smoke Test ---
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Get Endpoint
+        id: endpoint
+        working-directory: terraform
+        run: |
+          terraform init -input=false \
+            -backend-config="key=${{ matrix.environment }}.tfstate" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="subscription_id=${{ secrets.TF_STATE_SUBSCRIPTION_ID }}"
+
+          # Try Front Door first, then cluster FQDN
+          ENDPOINT=$(terraform output -raw frontdoor_endpoint_hostname 2>/dev/null || echo "")
+          if [ -z "$ENDPOINT" ]; then
+            ENDPOINT=$(terraform output -raw aks_cluster_fqdn 2>/dev/null || echo "")
+          fi
+          echo "url=https://$ENDPOINT" >> "$GITHUB_OUTPUT"
+          echo "Target endpoint: https://$ENDPOINT"
+
+      - name: Install k6
+        run: |
+          curl -fsSL https://github.com/grafana/k6/releases/download/v0.50.0/k6-v0.50.0-linux-amd64.tar.gz | tar xzf -
+          sudo mv k6-v0.50.0-linux-amd64/k6 /usr/local/bin/
+
+      - name: Run Smoke Test
+        id: smoketest
+        continue-on-error: true
+        run: |
+          echo "Running smoke test against: ${{ steps.endpoint.outputs.url }}"
+          k6 run \
+            --env TARGET_URL="${{ steps.endpoint.outputs.url }}" \
+            --summary-trend-stats="avg,min,med,max,p(90),p(95),p(99)" \
+            loadtest/k6-infra-test.js 2>&1 | tee smoketest_output.txt
+
+      - name: Upload Smoke Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoketest-results-${{ matrix.environment }}
+          path: |
+            loadtest/results.json
+            smoketest_output.txt
+          retention-days: 30
+
+      - name: Evaluate Smoke Test
+        if: steps.smoketest.outcome == 'failure'
+        run: |
+          echo "::warning::Post-deploy smoke test failed for ${{ matrix.environment }}. Review results artifact."
+          cat loadtest/results.json 2>/dev/null || echo "No results file generated"

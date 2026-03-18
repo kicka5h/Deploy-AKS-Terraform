@@ -1,0 +1,272 @@
+name: "Terraform Validate"
+run-name: "PR Terraform Validate (${{ github.head_ref }})"
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "terraform/**"
+      - ".github/workflows/terraform-validate.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  # -------------------------------------------------------
+  # Detect which environments have changes
+  # -------------------------------------------------------
+  detect-changes:
+    name: Detect Changed Environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.filter.outputs.environments }}
+      shared_changed: ${{ steps.filter.outputs.shared_changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine changed environments
+        id: filter
+        run: |
+          BASE_SHA=${{ github.event.pull_request.base.sha }}
+          HEAD_SHA=${{ github.event.pull_request.head.sha }}
+
+          CHANGED_FILES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- terraform/)
+
+          # Check if shared terraform files changed (anything outside env/)
+          SHARED_CHANGED="false"
+          if echo "$CHANGED_FILES" | grep -qvE '^terraform/env/'; then
+            SHARED_CHANGED="true"
+          fi
+          echo "shared_changed=$SHARED_CHANGED" >> "$GITHUB_OUTPUT"
+
+          # Build list of affected environments
+          ENVS=()
+
+          # If shared files changed, all environments are affected
+          if [ "$SHARED_CHANGED" = "true" ]; then
+            for f in terraform/env/*.tfvars; do
+              ENV_NAME=$(basename "$f" .tfvars)
+              ENVS+=("$ENV_NAME")
+            done
+          else
+            # Only environments whose tfvars changed
+            for f in $(echo "$CHANGED_FILES" | grep '^terraform/env/' || true); do
+              ENV_NAME=$(basename "$f" .tfvars)
+              ENVS+=("$ENV_NAME")
+            done
+          fi
+
+          # Deduplicate and build JSON array
+          UNIQUE_ENVS=$(printf '%s\n' "${ENVS[@]}" | sort -u | jq -R . | jq -sc .)
+          echo "environments=$UNIQUE_ENVS" >> "$GITHUB_OUTPUT"
+          echo "Affected environments: $UNIQUE_ENVS"
+
+  # -------------------------------------------------------
+  # Validate, Plan & Pre-flight Quota Check
+  # -------------------------------------------------------
+  validate:
+    name: "Validate (${{ matrix.environment }})"
+    needs: detect-changes
+    if: needs.detect-changes.outputs.environments != '[]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: ${{ fromJson(needs.detect-changes.outputs.environments) }}
+    environment: ${{ matrix.environment }}
+    defaults:
+      run:
+        working-directory: terraform
+    env:
+      ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Git Config
+        run: git config --global url."https://oauth2:${{ secrets.PAT }}@github.com".insteadOf https://github.com
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        id: init
+        run: |
+          terraform init -input=false \
+            -backend-config="key=${{ matrix.environment }}.tfstate" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="subscription_id=${{ secrets.TF_STATE_SUBSCRIPTION_ID }}"
+
+      - name: Terraform Format Check
+        id: fmt
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Validate
+        id: validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          terraform plan \
+            -var-file="env/${{ matrix.environment }}.tfvars" \
+            -lock=false \
+            -input=false \
+            -no-color \
+            -out="${{ matrix.environment }}.tfplan" 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Extract Resource Counts
+        id: resource_counts
+        if: steps.plan.outcome == 'success'
+        run: |
+          PLAN_TEXT=$(cat plan_output.txt)
+          ADD=$(echo "$PLAN_TEXT" | grep -oP '\d+(?= to add)' || echo "0")
+          CHANGE=$(echo "$PLAN_TEXT" | grep -oP '\d+(?= to change)' || echo "0")
+          DESTROY=$(echo "$PLAN_TEXT" | grep -oP '\d+(?= to destroy)' || echo "0")
+          echo "add=$ADD" >> "$GITHUB_OUTPUT"
+          echo "change=$CHANGE" >> "$GITHUB_OUTPUT"
+          echo "destroy=$DESTROY" >> "$GITHUB_OUTPUT"
+
+      # --- Pre-flight: export plan to JSON for analysis ---
+      - name: Export Plan JSON
+        id: plan_json
+        if: steps.plan.outcome == 'success'
+        run: terraform show -json "${{ matrix.environment }}.tfplan" > plan.json
+
+      # --- Pre-flight: Azure login for quota queries ---
+      - name: Azure Login
+        if: steps.plan.outcome == 'success'
+        uses: azure/login@v2
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.ARM_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.ARM_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.ARM_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.ARM_TENANT_ID }}"
+            }
+
+      # --- Pre-flight: Quota & Capacity Validation ---
+      - name: Pre-flight Quota & Capacity Check
+        id: preflight
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        run: |
+          bash ../scripts/preflight-quota-check.sh \
+            plan.json \
+            "env/${{ matrix.environment }}.tfvars" \
+            quota_report.md
+
+          echo "report<<QUOTA_EOF" >> "$GITHUB_OUTPUT"
+          cat quota_report.md >> "$GITHUB_OUTPUT"
+          echo "QUOTA_EOF" >> "$GITHUB_OUTPUT"
+
+      # --- Post PR Comment ---
+      - name: Post PR Comment
+        uses: actions/github-script@v7
+        if: always()
+        env:
+          VALIDATION: ${{ steps.validate.outputs.stdout }}
+          QUOTA_REPORT: ${{ steps.preflight.outputs.report }}
+          ADD: ${{ steps.resource_counts.outputs.add }}
+          CHANGE: ${{ steps.resource_counts.outputs.change }}
+          DESTROY: ${{ steps.resource_counts.outputs.destroy }}
+        with:
+          github-token: ${{ secrets.PAT }}
+          script: |
+            const fs = require('fs');
+            const env = '${{ matrix.environment }}';
+            const marker = `<!-- tf-validate-${env} -->`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.includes(marker));
+
+            const planOutcome = '${{ steps.plan.outcome }}';
+            const preflightOutcome = '${{ steps.preflight.outcome }}';
+            const allPassed = planOutcome === 'success' && preflightOutcome === 'success';
+            const statusIcon = allPassed ? '✅' : '❌';
+            const destroyCount = parseInt(process.env.DESTROY || '0');
+            const destroyWarn = destroyCount > 0 ? `\n> ⚠️ **${destroyCount} resource(s) will be destroyed**` : '';
+
+            // Read plan output from file (avoids GitHub output size limits)
+            let planText = 'N/A';
+            try {
+              planText = fs.readFileSync('terraform/plan_output.txt', 'utf8');
+              if (planText.length > 60000) {
+                planText = planText.substring(0, 60000) + '\n... (truncated)';
+              }
+            } catch (e) { /* ignore */ }
+
+            const output = `${marker}
+            ## ${statusIcon} Terraform Validation: \`${env}\`
+
+            | Step | Status |
+            |------|--------|
+            | Format | \`${{ steps.fmt.outcome }}\` |
+            | Init | \`${{ steps.init.outcome }}\` |
+            | Validate | \`${{ steps.validate.outcome }}\` |
+            | Plan | \`${{ steps.plan.outcome }}\` |
+            | Pre-flight Quota Check | \`${{ steps.preflight.outcome }}\` |
+
+            ### Resource Changes
+            | Add | Change | Destroy |
+            |-----|--------|---------|
+            | ${process.env.ADD || '-'} | ${process.env.CHANGE || '-'} | ${process.env.DESTROY || '-'} |
+            ${destroyWarn}
+
+            <details><summary>Validation Output</summary>
+
+            \`\`\`
+            ${process.env.VALIDATION || 'N/A'}
+            \`\`\`
+
+            </details>
+
+            <details><summary>Plan Output</summary>
+
+            \`\`\`
+            ${planText}
+            \`\`\`
+
+            </details>
+
+            <details><summary>Pre-flight Quota & Capacity Report</summary>
+
+            ${process.env.QUOTA_REPORT || 'Pre-flight check was skipped or unavailable'}
+
+            </details>
+
+            *Triggered by: @${{ github.actor }} | Workflow: \`${{ github.workflow }}\`*`;
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body: output,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: output,
+              });
+            }
