@@ -105,6 +105,8 @@ PR opened ──► detect-changes ──► validate (per env, parallel)
                                     ├── terraform init
                                     ├── terraform validate
                                     ├── terraform plan
+                                    ├── tfsec security scan
+                                    ├── Infracost cost estimate
                                     ├── pre-flight quota check
                                     └── PR comment with results
 ```
@@ -112,6 +114,18 @@ PR opened ──► detect-changes ──► validate (per env, parallel)
 **Change detection** automatically determines which environments are affected:
 - If shared Terraform files change (anything outside `terraform/env/`), all environments are validated
 - If only a specific `env/*.tfvars` changes, only that environment is validated
+
+**Security scanning (tfsec)** runs against the Terraform code with environment-specific variables:
+- Detects security misconfigurations (public endpoints, missing encryption, permissive network rules, etc.)
+- Results categorized by severity (critical, high, medium, low)
+- Fails the PR if any critical or high severity findings are detected
+- Each finding links to the relevant file/line and remediation documentation
+
+**Cost estimation (Infracost)** analyzes the plan JSON to estimate cost impact:
+- Shows previous, new, and differential monthly cost
+- Detailed per-resource cost breakdown
+- Cost increase warning surfaced in the PR comment
+- Requires an `INFRACOST_API_KEY` secret (free tier available at [infracost.io](https://www.infracost.io))
 
 **Pre-flight quota validation** (`scripts/preflight-quota-check.sh`) runs before any infrastructure is provisioned:
 - Parses the `terraform show -json` plan output to extract planned resources
@@ -123,10 +137,12 @@ PR opened ──► detect-changes ──► validate (per env, parallel)
 - Fails the PR check if any quota would be exceeded
 
 **PR comment** is posted/updated per environment with:
-- Step-by-step status table (fmt, init, validate, plan, quota check)
-- Resource change summary (add/change/destroy counts)
+- Step-by-step status table (fmt, init, validate, plan, tfsec, Infracost, quota check)
+- Resource change summary (add/change/destroy counts) with estimated monthly cost
 - Destroy warning if resources will be removed
-- Collapsible plan output and quota report
+- Security findings warning if critical/high issues found
+- Cost increase warning if monthly spend goes up
+- Collapsible sections for plan output, security report, cost breakdown, and quota report
 
 ### Deploy (`terraform-deploy.yml`)
 
@@ -207,6 +223,7 @@ Create a GitHub Environment for each deployment target (`lab`, `dev`, `uac`) wit
 | `TF_STATE_RG` | Resource group containing the state storage account |
 | `TF_STATE_SUBSCRIPTION_ID` | Subscription where state storage lives |
 | `PAT` | GitHub Personal Access Token |
+| `INFRACOST_API_KEY` | Infracost API key for cost estimation ([free signup](https://www.infracost.io)) |
 
 Each environment can point to a different Azure subscription. State storage can be centralized or per-environment.
 

@@ -66,7 +66,7 @@ jobs:
           echo "Affected environments: $UNIQUE_ENVS"
 
   # -------------------------------------------------------
-  # Validate, Plan & Pre-flight Quota Check
+  # Validate, Plan & Pre-flight Checks
   # -------------------------------------------------------
   validate:
     name: "Validate (${{ matrix.environment }})"
@@ -146,6 +146,121 @@ jobs:
         if: steps.plan.outcome == 'success'
         run: terraform show -json "${{ matrix.environment }}.tfplan" > plan.json
 
+      # --- tfsec: Security scanning ---
+      - name: Run tfsec
+        id: tfsec
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Install tfsec
+          curl -fsSL https://raw.githubusercontent.com/aquasecurity/tfsec/master/scripts/install_linux.sh | bash
+
+          # Run against plan JSON for accurate results (evaluates actual values, not just HCL)
+          tfsec . \
+            --format json \
+            --out tfsec_results.json \
+            --tfvars-file "env/${{ matrix.environment }}.tfvars" \
+            --no-color \
+            --soft-fail 2>&1 | tee tfsec_output.txt
+
+          # Generate summary
+          CRITICAL=$(jq '[.results[]? | select(.severity == "CRITICAL")] | length' tfsec_results.json 2>/dev/null || echo "0")
+          HIGH=$(jq '[.results[]? | select(.severity == "HIGH")] | length' tfsec_results.json 2>/dev/null || echo "0")
+          MEDIUM=$(jq '[.results[]? | select(.severity == "MEDIUM")] | length' tfsec_results.json 2>/dev/null || echo "0")
+          LOW=$(jq '[.results[]? | select(.severity == "LOW")] | length' tfsec_results.json 2>/dev/null || echo "0")
+          TOTAL=$((CRITICAL + HIGH + MEDIUM + LOW))
+
+          echo "critical=$CRITICAL" >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH" >> "$GITHUB_OUTPUT"
+          echo "medium=$MEDIUM" >> "$GITHUB_OUTPUT"
+          echo "low=$LOW" >> "$GITHUB_OUTPUT"
+          echo "total=$TOTAL" >> "$GITHUB_OUTPUT"
+
+          # Build markdown findings report
+          {
+            echo "### tfsec Security Scan"
+            echo ""
+            echo "| Severity | Count |"
+            echo "|----------|-------|"
+            echo "| Critical | $CRITICAL |"
+            echo "| High | $HIGH |"
+            echo "| Medium | $MEDIUM |"
+            echo "| Low | $LOW |"
+            echo "| **Total** | **$TOTAL** |"
+            echo ""
+
+            if [ "$TOTAL" -gt 0 ]; then
+              echo "#### Findings"
+              echo ""
+              jq -r '.results[]? | "- **[\(.severity)]** \(.rule_description) (\(.rule_id))\n  - File: `\(.location.filename):\(.location.start_line)`\n  - [Details](\(.links[0] // "N/A"))\n"' \
+                tfsec_results.json 2>/dev/null || echo "Could not parse findings"
+            else
+              echo "No security issues found."
+            fi
+          } > tfsec_report.md
+
+          echo "report<<TFSEC_EOF" >> "$GITHUB_OUTPUT"
+          cat tfsec_report.md >> "$GITHUB_OUTPUT"
+          echo "TFSEC_EOF" >> "$GITHUB_OUTPUT"
+
+          # Fail if critical or high findings
+          if [ "$CRITICAL" -gt 0 ] || [ "$HIGH" -gt 0 ]; then
+            echo "::error::tfsec found $CRITICAL critical and $HIGH high severity issues"
+            exit 1
+          fi
+
+      # --- Infracost: Cost estimation ---
+      - name: Setup Infracost
+        if: steps.plan.outcome == 'success'
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Run Infracost
+        id: infracost
+        if: steps.plan.outcome == 'success'
+        continue-on-error: true
+        run: |
+          # Generate cost breakdown from the plan JSON
+          infracost breakdown \
+            --path plan.json \
+            --format json \
+            --out-file infracost_results.json 2>&1 | tee infracost_output.txt
+
+          # Extract cost summary
+          MONTHLY_COST=$(jq -r '.totalMonthlyCost // "0"' infracost_results.json 2>/dev/null || echo "0")
+          PREV_MONTHLY_COST=$(jq -r '.pastTotalMonthlyCost // "0"' infracost_results.json 2>/dev/null || echo "0")
+          DIFF_COST=$(jq -r '.diffTotalMonthlyCost // "0"' infracost_results.json 2>/dev/null || echo "0")
+
+          echo "monthly_cost=$MONTHLY_COST" >> "$GITHUB_OUTPUT"
+          echo "prev_cost=$PREV_MONTHLY_COST" >> "$GITHUB_OUTPUT"
+          echo "diff_cost=$DIFF_COST" >> "$GITHUB_OUTPUT"
+
+          # Generate human-readable output
+          infracost output \
+            --path infracost_results.json \
+            --format table \
+            --out-file infracost_table.txt 2>/dev/null || true
+
+          # Build markdown report
+          {
+            echo "### Infracost Estimate"
+            echo ""
+            echo "| Metric | Monthly Cost |"
+            echo "|--------|-------------|"
+            echo "| Previous | \$$PREV_MONTHLY_COST |"
+            echo "| New | \$$MONTHLY_COST |"
+            echo "| Difference | \$$DIFF_COST |"
+            echo ""
+            echo '```'
+            cat infracost_table.txt 2>/dev/null || echo "Detailed breakdown unavailable"
+            echo '```'
+          } > infracost_report.md
+
+          echo "report<<COST_EOF" >> "$GITHUB_OUTPUT"
+          cat infracost_report.md >> "$GITHUB_OUTPUT"
+          echo "COST_EOF" >> "$GITHUB_OUTPUT"
+
       # --- Pre-flight: Azure login for quota queries ---
       - name: Azure Login
         if: steps.plan.outcome == 'success'
@@ -181,6 +296,13 @@ jobs:
         env:
           VALIDATION: ${{ steps.validate.outputs.stdout }}
           QUOTA_REPORT: ${{ steps.preflight.outputs.report }}
+          TFSEC_REPORT: ${{ steps.tfsec.outputs.report }}
+          INFRACOST_REPORT: ${{ steps.infracost.outputs.report }}
+          TFSEC_CRITICAL: ${{ steps.tfsec.outputs.critical }}
+          TFSEC_HIGH: ${{ steps.tfsec.outputs.high }}
+          TFSEC_TOTAL: ${{ steps.tfsec.outputs.total }}
+          MONTHLY_COST: ${{ steps.infracost.outputs.monthly_cost }}
+          DIFF_COST: ${{ steps.infracost.outputs.diff_cost }}
           ADD: ${{ steps.resource_counts.outputs.add }}
           CHANGE: ${{ steps.resource_counts.outputs.change }}
           DESTROY: ${{ steps.resource_counts.outputs.destroy }}
@@ -200,17 +322,35 @@ jobs:
 
             const planOutcome = '${{ steps.plan.outcome }}';
             const preflightOutcome = '${{ steps.preflight.outcome }}';
-            const allPassed = planOutcome === 'success' && preflightOutcome === 'success';
+            const tfsecOutcome = '${{ steps.tfsec.outcome }}';
+            const infracostOutcome = '${{ steps.infracost.outcome }}';
+            const allPassed = planOutcome === 'success' &&
+                              preflightOutcome === 'success' &&
+                              tfsecOutcome === 'success';
             const statusIcon = allPassed ? '✅' : '❌';
             const destroyCount = parseInt(process.env.DESTROY || '0');
             const destroyWarn = destroyCount > 0 ? `\n> ⚠️ **${destroyCount} resource(s) will be destroyed**` : '';
 
-            // Read plan output from file (avoids GitHub output size limits)
+            // Security warning
+            const tfsecCritical = parseInt(process.env.TFSEC_CRITICAL || '0');
+            const tfsecHigh = parseInt(process.env.TFSEC_HIGH || '0');
+            const secWarn = (tfsecCritical > 0 || tfsecHigh > 0)
+              ? `\n> 🔴 **${tfsecCritical} critical, ${tfsecHigh} high severity security findings — must be resolved**`
+              : '';
+
+            // Cost summary
+            const monthlyCost = process.env.MONTHLY_COST || '-';
+            const diffCost = process.env.DIFF_COST || '0';
+            const costNote = parseFloat(diffCost) > 0
+              ? `\n> 💰 **Estimated cost increase: +$${diffCost}/month**`
+              : '';
+
+            // Read plan output from file
             let planText = 'N/A';
             try {
               planText = fs.readFileSync('terraform/plan_output.txt', 'utf8');
-              if (planText.length > 60000) {
-                planText = planText.substring(0, 60000) + '\n... (truncated)';
+              if (planText.length > 40000) {
+                planText = planText.substring(0, 40000) + '\n... (truncated)';
               }
             } catch (e) { /* ignore */ }
 
@@ -223,13 +363,15 @@ jobs:
             | Init | \`${{ steps.init.outcome }}\` |
             | Validate | \`${{ steps.validate.outcome }}\` |
             | Plan | \`${{ steps.plan.outcome }}\` |
+            | Security Scan (tfsec) | \`${{ steps.tfsec.outcome }}\` |
+            | Cost Estimate (Infracost) | \`${{ steps.infracost.outcome }}\` |
             | Pre-flight Quota Check | \`${{ steps.preflight.outcome }}\` |
 
             ### Resource Changes
-            | Add | Change | Destroy |
-            |-----|--------|---------|
-            | ${process.env.ADD || '-'} | ${process.env.CHANGE || '-'} | ${process.env.DESTROY || '-'} |
-            ${destroyWarn}
+            | Add | Change | Destroy | Est. Monthly Cost |
+            |-----|--------|---------|-------------------|
+            | ${process.env.ADD || '-'} | ${process.env.CHANGE || '-'} | ${process.env.DESTROY || '-'} | $${monthlyCost} |
+            ${destroyWarn}${secWarn}${costNote}
 
             <details><summary>Validation Output</summary>
 
@@ -244,6 +386,18 @@ jobs:
             \`\`\`
             ${planText}
             \`\`\`
+
+            </details>
+
+            <details><summary>Security Scan Report (tfsec)</summary>
+
+            ${process.env.TFSEC_REPORT || 'Security scan was skipped or unavailable'}
+
+            </details>
+
+            <details><summary>Cost Estimate (Infracost)</summary>
+
+            ${process.env.INFRACOST_REPORT || 'Cost estimate was skipped or unavailable'}
 
             </details>
 
